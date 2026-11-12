@@ -1,0 +1,18 @@
+{
+  "name": "ecommerce-poc",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "gateway/*",
+    "services/*"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace=apps/web",
+    "dev:gateway": "npm run dev --workspace=gateway/graphql-gateway",
+    "dev:user": "npm run dev --workspace=services/user-service",
+    "dev:inventory": "npm run dev --workspace=services/inventory-service",
+    "dev:order": "npm run dev --workspace=services/order-service",
+    "dev:payment": "npm run dev --workspace=services/payment-service"
+  }
+}
