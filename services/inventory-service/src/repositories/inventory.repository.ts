@@ -125,6 +125,25 @@ export async function getReservation(
   }
 }
 
+export async function getExpiredReservationIds(
+  batchSize: number
+): Promise<string[]> {
+  if (!Number.isInteger(batchSize) || batchSize <= 0 || batchSize > 1000) {
+    throw new Error('Batch size must be an integer between 1 and 1000');
+  }
+
+  const result = await pool.query(
+    `SELECT id
+     FROM reservations
+     WHERE status = 'RESERVED'
+       AND expires_at <= clock_timestamp()
+     ORDER BY expires_at ASC, id ASC
+     LIMIT $1`,
+    [batchSize]
+  );
+
+  return result.rows.map((row) => String(row.id));
+}
 export async function reserveStock(
   items: ReservationItemInput[],
   idempotencyKey: string
@@ -290,6 +309,21 @@ export async function changeReservationStatus(
       );
     }
 
+
+// Expired reservations must never consume physical inventory.
+// Use database wall-clock time after acquiring the reservation lock.
+    if (nextStatus === 'CONFIRMED') {
+      const expiryResult = await client.query(
+        `SELECT expires_at <= clock_timestamp() AS is_expired
+         FROM reservations
+         WHERE id = $1`,
+        [id]
+      );
+
+      if (expiryResult.rows[0]?.is_expired) {
+        throw new Error('Cannot confirm an expired reservation');
+      }
+    }
     const items = await client.query(
       `SELECT product_id, quantity
        FROM reservation_items

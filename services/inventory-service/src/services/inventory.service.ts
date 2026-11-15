@@ -2,6 +2,7 @@ import {
   getProducts,
   getProduct,
   getReservation,
+  getExpiredReservationIds,
   reserveStock as reserveStockRepository,
   changeReservationStatus,
   ReservationItemInput
@@ -59,6 +60,54 @@ export async function reserveStock(
   );
 }
 
+export interface ReservationExpiryBatchResult {
+  scanned: number;
+  released: number;
+  skipped: number;
+  errors: {
+    reservationId: string;
+    message: string;
+  }[];
+}
+
+export async function expireReservations(
+  batchSize: number
+): Promise<ReservationExpiryBatchResult> {
+  const reservationIds = await getExpiredReservationIds(batchSize);
+
+  let released = 0;
+  let skipped = 0;
+
+  const errors: ReservationExpiryBatchResult['errors'] = [];
+
+  for (const reservationId of reservationIds) {
+    try {
+      const reservation = await changeReservationStatus(
+        reservationId,
+        'RELEASED'
+      );
+
+      if (reservation.status === 'RELEASED') {
+        released++;
+      } else {
+        skipped++;
+      }
+    } catch (error) {
+      errors.push({
+        reservationId,
+        message:
+          error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  return {
+    scanned: reservationIds.length,
+    released,
+    skipped,
+    errors
+  };
+}
 export async function confirmReservation(id: string) {
   return changeReservationStatus(id, 'CONFIRMED');
 }

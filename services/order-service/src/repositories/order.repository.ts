@@ -350,3 +350,89 @@ export async function markOrderFailed(
     );
   }
 }
+
+// Returns IDs of orders that have remained PENDING beyond staleMs.
+export async function getStalePendingOrderIds(
+  staleMs = 60000,
+  limit = 20
+): Promise<string[]> {
+  if (!Number.isFinite(staleMs) || staleMs <= 0) {
+    throw new Error('staleMs must be greater than zero');
+  }
+
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new Error('limit must be a positive integer');
+  }
+
+  const result = await pool.query<{ id: string }>(
+    `SELECT id
+     FROM orders
+     WHERE status = 'PENDING'
+       AND updated_at < NOW() - ($1 * INTERVAL '1 millisecond')
+     ORDER BY updated_at ASC
+     LIMIT $2`,
+    [staleMs, limit]
+  );
+
+  return result.rows.map(row => row.id);
+}
+
+// Holds a PostgreSQL session-level lock while the Saga operation runs.
+export async function withOrderSagaLock<T>(
+  orderId: string,
+  work: () => Promise<T>
+): Promise<
+  | { acquired: false }
+  | { acquired: true; result: T }
+> {
+  const client = await pool.connect();
+  let lockAcquired = false;
+  let clientReleased = false;
+
+  const lockKey = `order-saga:${orderId}`;
+
+  try {
+    const lockResult = await client.query<{ locked: boolean }>(
+      `SELECT pg_try_advisory_lock(
+        hashtextextended($1, 0)
+      ) AS locked`,
+      [lockKey]
+    );
+
+    lockAcquired = lockResult.rows[0].locked;
+
+    if (!lockAcquired) {
+      return { acquired: false };
+    }
+
+    const result = await work();
+
+    return {
+      acquired: true,
+      result
+    };
+  } finally {
+    if (lockAcquired) {
+      try {
+        await client.query(
+          `SELECT pg_advisory_unlock(
+            hashtextextended($1, 0)
+          )`,
+          [lockKey]
+        );
+      } catch (unlockError) {
+        // Destroy the connection rather than returning a locked
+        // session to the connection pool.
+        client.release(unlockError as Error);
+        clientReleased = true;
+        throw unlockError;
+      }
+    }
+
+    if (!clientReleased) {
+      client.release();
+    }
+  }
+}
+
+

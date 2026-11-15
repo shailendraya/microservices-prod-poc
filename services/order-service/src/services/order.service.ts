@@ -1,4 +1,4 @@
-﻿import 'dotenv/config';
+import 'dotenv/config';
 
 import {
   attachInventoryReservation,
@@ -8,9 +8,10 @@ import {
   getOrdersByUserId,
   markOrderConfirmed,
   markOrderFailed,
-  type Order,
+    type Order,
   type OrderItem,
-  type PaymentStatus
+  type PaymentStatus,
+  withOrderSagaLock
 } from '../repositories/order.repository.js';
 
 const INVENTORY_URL =
@@ -86,6 +87,15 @@ interface ReservationResponse {
     status: string;
   };
 }
+interface InventoryReservationDetails {
+  id: string;
+  status: string;
+  expiresAt: string;
+}
+
+interface InventoryReservationResponse {
+  reservation: InventoryReservationDetails | null;
+}
 
 interface ReservationStatusResponse {
   confirmReservation: {
@@ -110,6 +120,19 @@ interface PaymentResponse {
     status: PaymentStatus;
     failureReason: string | null;
   };
+}
+
+interface PaymentDetails {
+  id: string;
+  orderId: string;
+  amount: number;
+  currency: string;
+  status: PaymentStatus;
+  failureReason: string | null;
+}
+
+interface PaymentLookupResponse {
+  paymentsByOrderId: PaymentDetails[];
 }
 
 interface CreateOrderInput {
@@ -217,6 +240,55 @@ async function processPaymentForOrder(order: Order) {
   );
 }
 
+async function findPaymentsForOrder(
+  orderId: string
+): Promise<PaymentDetails[]> {
+  const query = `
+    query($orderId: ID!) {
+      paymentsByOrderId(orderId: $orderId) {
+        id
+        orderId
+        amount
+        currency
+        status
+        failureReason
+      }
+    }
+  `;
+
+  const data = await graphqlRequest<PaymentLookupResponse>(
+    PAYMENT_URL,
+    query,
+    { orderId }
+  );
+
+  return data.paymentsByOrderId;
+}
+
+function validatePaymentForOrder(
+  payment: PaymentDetails,
+  order: Order
+): void {
+  if (payment.orderId !== order.id) {
+    throw new Error('Payment service returned a different order ID');
+  }
+
+  if (
+    !Number.isFinite(Number(payment.amount)) ||
+    Math.round(Number(payment.amount) * 100) !==
+      Math.round(order.totalAmount * 100)
+  ) {
+    throw new Error('Payment amount does not match the order amount');
+  }
+
+  if (
+    payment.currency.trim().toUpperCase() !==
+    order.currency.trim().toUpperCase()
+  ) {
+    throw new Error('Payment currency does not match the order currency');
+  }
+}
+
 async function confirmInventory(order: Order): Promise<void> {
   if (!order.inventoryReservationId) {
     throw new Error('Order has no inventory reservation');
@@ -259,6 +331,37 @@ async function releaseInventory(order: Order): Promise<void> {
   );
 }
 
+async function findInventoryReservation(
+  reservationId: string
+): Promise<InventoryReservationDetails | null> {
+  const query = `
+    query($id: ID!) {
+      reservation(id: $id) {
+        id
+        status
+        expiresAt
+      }
+    }
+  `;
+
+  try {
+    const data = await graphqlRequest<InventoryReservationResponse>(
+      INVENTORY_URL,
+      query,
+      { id: reservationId }
+    );
+
+    return data.reservation;
+  } catch (error) {
+    const code = (error as Error & { code?: string }).code;
+
+    if (code === 'NOT_FOUND') {
+      return null;
+    }
+
+    throw error;
+  }
+}
 async function getRequiredOrder(orderId: string): Promise<Order> {
   const order = await getOrder(orderId);
 
@@ -332,12 +435,93 @@ async function continueOrderSaga(initialOrder: Order): Promise<Order> {
     return getRequiredOrder(order.id);
   }
 
-  // Step 4: Process or retrieve the existing payment.
-  const paymentData = await processPaymentForOrder(order);
-  const payment = paymentData.processPayment;
+  // Step 4: Look up an existing payment before creating or processing one.
+  const lookupData = await findPaymentsForOrder(order.id);
+  const existingPayments = lookupData;
 
-  if (payment.orderId !== order.id) {
-    throw new Error('Payment service returned a different order ID');
+  let payment: PaymentDetails;
+
+  if (existingPayments.length > 1) {
+    throw new Error(
+      `Multiple payments found for order ${order.id}. Manual reconciliation is required.`
+    );
+  }
+
+  if (existingPayments.length === 1) {
+    payment = existingPayments[0];
+
+    validatePaymentForOrder(payment, order);
+
+    if (order.paymentId && order.paymentId !== payment.id) {
+      throw new Error(
+        `Order payment ID does not match Payment Service record. orderId=${order.id}`
+      );
+    }
+  } else {
+    if (order.paymentId) {
+      throw new Error(
+        `Order references payment ${order.paymentId}, but Payment Service returned no payment.`
+      );
+    }
+
+    // No payment exists. Validate the inventory reservation before charging.
+    const reservation = order.inventoryReservationId
+      ? await findInventoryReservation(order.inventoryReservationId)
+      : null;
+
+    if (!reservation) {
+      await markOrderFailed(
+        order.id,
+        'Inventory reservation not found. Payment was not initiated.'
+      );
+
+      return getRequiredOrder(order.id);
+    }
+
+    if (reservation.status === 'CONFIRMED') {
+      throw new Error(
+        `Reservation ${reservation.id} is already CONFIRMED, but no payment exists. Manual reconciliation is required.`
+      );
+    }
+
+    const expiryTime = Date.parse(reservation.expiresAt);
+
+    if (!Number.isFinite(expiryTime)) {
+      throw new Error(
+        `Invalid reservation expiry timestamp. reservationId=${reservation.id}`
+      );
+    }
+
+    const isExpired = expiryTime <= Date.now();
+
+    if (
+      reservation.status === 'RELEASED' ||
+      reservation.status === 'EXPIRED' ||
+      (reservation.status === 'RESERVED' && isExpired)
+    ) {
+      if (reservation.status === 'RESERVED') {
+        await releaseInventory(order);
+      }
+
+      await markOrderFailed(
+        order.id,
+        'Inventory reservation expired or was released. Payment was not initiated.'
+      );
+
+      return getRequiredOrder(order.id);
+    }
+
+    if (reservation.status !== 'RESERVED') {
+      throw new Error(
+        `Unexpected inventory reservation status: ${reservation.status}`
+      );
+    }
+
+    // Reservation is active. Use the same stable payment idempotency key.
+    const paymentData = await processPaymentForOrder(order);
+    payment = paymentData.processPayment;
+
+    validatePaymentForOrder(payment, order);
   }
 
   await attachPayment(order.id, payment.id, payment.status);
@@ -375,6 +559,21 @@ async function continueOrderSaga(initialOrder: Order): Promise<Order> {
   }
 
   throw new Error(`Unexpected payment status: ${payment.status}`);
+}
+
+// Acquires the same lock for API requests and background recovery.
+export async function resumeOrderSaga(orderId: string): Promise<Order> {
+  const lockResult = await withOrderSagaLock(orderId, async () => {
+    const latestOrder = await getRequiredOrder(orderId);
+    return continueOrderSaga(latestOrder);
+  });
+
+  // Another process is already handling this order.
+  if (!lockResult.acquired) {
+    return getRequiredOrder(orderId);
+  }
+
+  return lockResult.result;
 }
 
 export async function createOrder(
@@ -470,7 +669,7 @@ export async function createOrder(
     items: orderItems
   });
 
-  return continueOrderSaga(order);
+  return resumeOrderSaga(order.id);
 }
 
 export async function findOrder(id: string) {
@@ -480,3 +679,5 @@ export async function findOrder(id: string) {
 export async function listOrders(userId: string) {
   return getOrdersByUserId(userId);
 }
+
+

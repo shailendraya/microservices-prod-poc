@@ -39,3 +39,7 @@ export async function createApp() {
 
   return app;
 }
+export async function stopApp(): Promise<void> {
+  await apolloServer.stop();
+  console.log('[INVENTORY_SERVICE] Apollo Server stopped');
+}
