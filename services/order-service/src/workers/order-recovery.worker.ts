@@ -1,128 +1,136 @@
 ﻿import { getStalePendingOrderIds } from '../repositories/order.repository.js';
 import { resumeOrderSaga } from '../services/order.service.js';
 
-interface OrderRecoveryConfig {
+export interface OrderRecoveryWorkerOptions {
   enabled: boolean;
   intervalMs: number;
   staleMs: number;
   batchSize: number;
 }
 
-function getConfig(): OrderRecoveryConfig {
-  const config = {
-    enabled: process.env.ORDER_RECOVERY_ENABLED !== 'false',
-    intervalMs: Number(process.env.ORDER_RECOVERY_INTERVAL_MS || 30000),
-    staleMs: Number(process.env.ORDER_RECOVERY_STALE_MS || 60000),
-    batchSize: Number(process.env.ORDER_RECOVERY_BATCH_SIZE || 20)
-  };
+export function startOrderRecoveryWorker(
+  options: OrderRecoveryWorkerOptions
+): { stop: () => Promise<void> } {
+  const {
+    enabled,
+    intervalMs,
+    staleMs,
+    batchSize
+  } = options;
+
+  if (!enabled) {
+    console.log('[ORDER_RECOVERY_WORKER] Disabled');
+
+    return {
+      stop: async () => {}
+    };
+  }
 
   if (
-    !Number.isFinite(config.intervalMs) ||
-    config.intervalMs <= 0 ||
-    !Number.isFinite(config.staleMs) ||
-    config.staleMs <= 0 ||
-    !Number.isInteger(config.batchSize) ||
-    config.batchSize <= 0
+    !Number.isInteger(intervalMs) ||
+    intervalMs <= 0 ||
+    !Number.isInteger(staleMs) ||
+    staleMs <= 0 ||
+    !Number.isInteger(batchSize) ||
+    batchSize <= 0
   ) {
     throw new Error('Invalid Order Recovery Worker configuration');
   }
 
-  return config;
-}
-
-export function startOrderRecoveryWorker(): () => Promise<void> {
-  const config = getConfig();
-
-  if (!config.enabled) {
-    console.log('[ORDER_RECOVERY_WORKER] Disabled');
-    return async () => {};
-  }
-
-  let stopped = false;
   let activeRun: Promise<void> | null = null;
-  let timer: ReturnType<typeof setInterval> | undefined;
+  let stopped = false;
 
-  const runBatch = async (): Promise<void> => {
-    try {
-      const orderIds = await getStalePendingOrderIds(
-        config.staleMs,
-        config.batchSize
-      );
+  const runOnce = async (): Promise<void> => {
+    if (stopped || activeRun) {
+      return;
+    }
 
-      let resumed = 0;
-      let skipped = 0;
+    const currentRun = (async () => {
+      let scanned = 0;
+      let attempted = 0;
       let errors = 0;
 
-      for (const orderId of orderIds) {
-        if (stopped) break;
+      try {
+        const orderIds = await getStalePendingOrderIds(
+          staleMs,
+          batchSize
+        );
 
-        try {
-          const result = await resumeOrderSaga(orderId);
+        scanned = orderIds.length;
 
-          if (result) {
-            resumed++;
+        for (const orderId of orderIds) {
+          if (stopped) {
+            break;
+          }
+
+          attempted++;
+
+          try {
+            await resumeOrderSaga(orderId);
 
             console.log(
-              `[ORDER_RECOVERY_WORKER] Order processed. orderId=${orderId} status=${result.status}`
+              `[ORDER_RECOVERY] Saga resumed. orderId=${orderId}`
             );
-          } else {
-            skipped++;
+          } catch (error) {
+            errors++;
+
+            console.error(
+              `[ORDER_RECOVERY] Failed to resume Saga. orderId=${orderId}`,
+              error
+            );
           }
-        } catch (error) {
-          errors++;
-
-          console.error(
-            `[ORDER_RECOVERY_WORKER] Order recovery failed. orderId=${orderId}`,
-            error
-          );
         }
+
+        if (scanned > 0 || errors > 0) {
+          console.log('[ORDER_RECOVERY_WORKER] Batch completed', {
+            scanned,
+            attempted,
+            errors
+          });
+        }
+      } catch (error) {
+        console.error(
+          '[ORDER_RECOVERY_WORKER] Batch execution failed',
+          error
+        );
       }
+    })();
 
-      console.log('[ORDER_RECOVERY_WORKER] Batch completed', {
-        scanned: orderIds.length,
-        resumed,
-        skipped,
-        errors
-      });
-    } catch (error) {
-      console.error('[ORDER_RECOVERY_WORKER] Batch failed', error);
+    activeRun = currentRun;
+
+    try {
+      await currentRun;
+    } finally {
+      if (activeRun === currentRun) {
+        activeRun = null;
+      }
     }
-  };
-
-  const startRun = (): void => {
-    if (stopped || activeRun) return;
-
-    activeRun = runBatch().finally(() => {
-      activeRun = null;
-    });
   };
 
   console.log('[ORDER_RECOVERY_WORKER] Started', {
-    enabled: true,
-    intervalMs: config.intervalMs,
-    staleMs: config.staleMs,
-    batchSize: config.batchSize
+    enabled,
+    intervalMs,
+    staleMs,
+    batchSize
   });
 
-  // Run immediately when the worker starts.
-  startRun();
+  // Run once immediately when the worker starts.
+  void runOnce();
 
-  // Run periodically.
-  timer = setInterval(startRun, config.intervalMs);
+  const interval = setInterval(() => {
+    void runOnce();
+  }, intervalMs);
 
-  return async (): Promise<void> => {
-    stopped = true;
+  return {
+    stop: async () => {
+      stopped = true;
+      clearInterval(interval);
 
-    if (timer) {
-      clearInterval(timer);
-      timer = undefined;
+      if (activeRun) {
+        await activeRun;
+      }
+
+      console.log('[ORDER_RECOVERY_WORKER] Stopped');
     }
-
-    // Wait for the currently running batch to finish.
-    if (activeRun) {
-      await activeRun;
-    }
-
-    console.log('[ORDER_RECOVERY_WORKER] Stopped');
   };
 }

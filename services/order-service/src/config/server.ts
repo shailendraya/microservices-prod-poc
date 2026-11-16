@@ -12,7 +12,29 @@ const server = app.listen(PORT, () => {
   console.log(`Order Service running at http://localhost:${PORT}/graphql`);
 });
 
-const stopRecoveryWorker = startOrderRecoveryWorker();
+// Order Recovery Worker configuration
+const recoveryEnabled =
+  process.env.ORDER_RECOVERY_ENABLED !== 'false';
+
+const recoveryIntervalMs = Number(
+  process.env.ORDER_RECOVERY_INTERVAL_MS || 30000
+);
+
+const recoveryStaleMs = Number(
+  process.env.ORDER_RECOVERY_STALE_MS || 60000
+);
+
+const recoveryBatchSize = Number(
+  process.env.ORDER_RECOVERY_BATCH_SIZE || 20
+);
+
+// Start the worker and retain its stop method.
+const recoveryWorker = startOrderRecoveryWorker({
+  enabled: recoveryEnabled,
+  intervalMs: recoveryIntervalMs,
+  staleMs: recoveryStaleMs,
+  batchSize: recoveryBatchSize
+});
 
 let shuttingDown = false;
 
@@ -27,7 +49,7 @@ async function shutdown(signal: string): Promise<void> {
 
   // Stop the recovery worker first.
   try {
-    await stopRecoveryWorker();
+    await recoveryWorker.stop();
   } catch (error) {
     shutdownFailed = true;
     console.error('[ORDER_SERVICE] Failed to stop recovery worker', error);
